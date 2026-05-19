@@ -2,10 +2,24 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="0; url=https://hash-planner.github.io/workbook">
-  <title>Redirecting...</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redirecting…</title>
+  <script>
+    (function () {
+      var ua = navigator.userAgent || '';
+      var isMobile = /Mobi|Android|iPhone|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+      var isTablet = /iPad|Tablet|PlayBook|Silk|(android(?!.*mobile))/i.test(ua);
+
+      if (isMobile && !isTablet) {
+        window.location.replace("https://hash-planner.github.io/workbook-mob");
+      } else {
+        window.location.replace("https://hash-planner.github.io/workbook");
+      }
+    })();
+  </script>
+  <noscript>
+    <meta http-equiv="refresh" content="0; url=https://hash-planner.github.io/workbook">
+  </noscript>
 </head>
-<body>
-  <script>window.location.replace("https://hash-planner.github.io/workbook");</script>
-</body>
+<body></body>
 </html>
