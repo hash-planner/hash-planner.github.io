@@ -1,9 +1,20 @@
 (() => {
+  const ADAPTER_VERSION = "2026.10.15.3";
   const cfg = window.APEX_CONFIG || {};
   if (cfg.backendMode !== "supabase") return;
 
-  const invalidConfig = !cfg.supabaseUrl || !cfg.supabasePublishableKey ||
-    cfg.supabaseUrl.includes("YOUR-PROJECT") || cfg.supabasePublishableKey.includes("YOUR-");
+  const configured = cfg.supabaseUrl && cfg.supabasePublishableKey &&
+    !cfg.supabaseUrl.includes("YOUR-PROJECT") && !cfg.supabasePublishableKey.includes("YOUR-");
+  if (!configured || !window.supabase?.createClient) {
+    alert("Supabase configuration is incomplete or the Supabase library did not load.");
+    return;
+  }
+
+  const client = window.supabase.createClient(cfg.supabaseUrl, cfg.supabasePublishableKey, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+  });
+  window.apexSupabase = client;
+  let currentUser = null;
 
   const style = document.createElement("style");
   style.textContent = `
@@ -23,136 +34,107 @@
 
   const gate = document.createElement("div");
   gate.id = "apex-auth-gate";
-  gate.innerHTML = `<div id="apex-auth-card">
-    <h1>APEX AUTO</h1><div>SERVICE INVOICE</div>
+  gate.innerHTML = `<div id="apex-auth-card"><h1>APEX AUTO</h1><div>SERVICE INVOICE</div>
     <p>Sign in to access invoice records.</p>
     <label>Email<input id="apex-login-email" type="email" autocomplete="username"></label>
     <label>Password<input id="apex-login-password" type="password" autocomplete="current-password"></label>
-    <button id="apex-login-button" type="button">Sign In</button>
-    <div id="apex-auth-error"></div>
-  </div>`;
-  document.documentElement.appendChild(gate);
+    <button id="apex-login-button" type="button">Sign In</button><div id="apex-auth-error"></div></div>`;
 
-  if (invalidConfig || !window.supabase?.createClient) {
-    gate.querySelector("#apex-auth-error").textContent = invalidConfig
-      ? "Supabase configuration is incomplete. Update supabase-config.js."
-      : "The Supabase library could not be loaded.";
-    gate.querySelector("#apex-login-button").disabled = true;
-    return;
+  function mountGate(){ if(!gate.isConnected) (document.body || document.documentElement).appendChild(gate); }
+  function allowed(user){ return !!user && (!cfg.allowedEmail || user.email?.toLowerCase() === cfg.allowedEmail.toLowerCase()); }
+  function setStatus(text, good=false){
+    const el=document.getElementById("folderStatus");
+    if(el){ el.textContent=text; el.style.color=good?"#08734e":"#9a5a00"; }
+  }
+  function escapeHtml(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot',"'":'&#39;'}[c]));}
+  function showSignedIn(user){
+    currentUser=user; gate.style.display="none";
+    let badge=document.getElementById("apex-cloud-user");
+    if(!badge){badge=document.createElement("div");badge.id="apex-cloud-user";(document.body||document.documentElement).appendChild(badge);}
+    badge.innerHTML=`Cloud: ${escapeHtml(user.email||"Signed in")}<button type="button">Sign Out</button>`;
+    badge.querySelector("button").onclick=async()=>{await client.auth.signOut();location.reload();};
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Loading cloud database...",true);
   }
 
-  const client = window.supabase.createClient(cfg.supabaseUrl, cfg.supabasePublishableKey, {
-    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
-  });
-  window.apexSupabase = client;
-
-  let currentUser = null;
-  let readyResolve;
-  const ready = new Promise(resolve => readyResolve = resolve);
-  window.apexSupabaseReady = ready;
-
-  function allowed(user) {
-    return !!user && (!cfg.allowedEmail || user.email?.toLowerCase() === cfg.allowedEmail.toLowerCase());
+  async function sessionUser(){
+    if(currentUser) return currentUser;
+    const {data,error}=await client.auth.getSession();
+    if(error) throw error;
+    const user=data.session?.user||null;
+    if(user && allowed(user)){ showSignedIn(user); return user; }
+    return null;
   }
 
-  function showSignedIn(user) {
-    currentUser = user;
-    gate.style.display = "none";
-    let badge = document.getElementById("apex-cloud-user");
-    if (!badge) {
-      badge = document.createElement("div");
-      badge.id = "apex-cloud-user";
-      document.body.appendChild(badge);
-    }
-    badge.innerHTML = `Cloud: ${escapeHtml(user.email || "Signed in")}<button type="button">Sign Out</button>`;
-    badge.querySelector("button").onclick = async () => { await client.auth.signOut(); location.reload(); };
-    readyResolve(user);
+  async function initialize(){
+    mountGate();
+    try{
+      const user=await sessionUser();
+      if(!user) gate.style.display="grid";
+    }catch(e){gate.style.display="grid";gate.querySelector("#apex-auth-error").textContent=e.message;}
   }
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",initialize,{once:true}); else initialize();
 
-  function escapeHtml(value) {
-    return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-
-  async function initializeAuth() {
-    const { data: { session } } = await client.auth.getSession();
-    if (allowed(session?.user)) showSignedIn(session.user);
-    else if (session?.user) {
-      await client.auth.signOut();
-      gate.querySelector("#apex-auth-error").textContent = "This account is not authorized for this app.";
-    }
-  }
-
-  gate.querySelector("#apex-login-button").onclick = async () => {
-    const email = gate.querySelector("#apex-login-email").value.trim();
-    const password = gate.querySelector("#apex-login-password").value;
-    const errorBox = gate.querySelector("#apex-auth-error");
-    errorBox.textContent = "Signing in...";
-    const { data, error } = await client.auth.signInWithPassword({ email, password });
-    if (error) { errorBox.textContent = error.message; return; }
-    if (!allowed(data.user)) {
-      await client.auth.signOut();
-      errorBox.textContent = "This account is not authorized for this app.";
-      return;
-    }
-    errorBox.textContent = "";
-    showSignedIn(data.user);
+  gate.querySelector("#apex-login-button").onclick=async()=>{
+    const email=gate.querySelector("#apex-login-email").value.trim();
+    const password=gate.querySelector("#apex-login-password").value;
+    const errorBox=gate.querySelector("#apex-auth-error");
+    errorBox.textContent="Signing in...";
+    const {data,error}=await client.auth.signInWithPassword({email,password});
+    if(error){errorBox.textContent=error.message;return;}
+    if(!allowed(data.user)){await client.auth.signOut();errorBox.textContent="This account is not authorized for this app.";return;}
     location.reload();
   };
-  gate.querySelector("#apex-login-password").addEventListener("keydown", e => {
-    if (e.key === "Enter") gate.querySelector("#apex-login-button").click();
-  });
+  gate.querySelector("#apex-login-password").addEventListener("keydown",e=>{if(e.key==="Enter")gate.querySelector("#apex-login-button").click();});
 
-  initializeAuth();
-
-  const nativeFetch = window.fetch.bind(window);
-  window.fetch = async (input, init = {}) => {
-    const url = typeof input === "string" ? input : input.url;
-    if (!url.startsWith("/api/invoices")) return nativeFetch(input, init);
-
-    await ready;
-    if (!currentUser) return new Response("Unauthorized", { status: 401 });
-    return (init.method || "GET").toUpperCase() === "POST"
-      ? saveMaster(String(init.body || ""))
-      : loadMaster();
-  };
-
-  async function createDailyBackup(csvText) {
-    const today = new Date().toISOString().slice(0, 10);
-    const { data, error } = await client.from("invoice_backups")
-      .select("backup_date").eq("user_id", currentUser.id).eq("backup_date", today).maybeSingle();
-    if (error) throw error;
-    if (data) return false;
-    const { error: insertError } = await client.from("invoice_backups").insert({
-      user_id: currentUser.id, backup_date: today, csv_text: csvText
-    });
-    if (insertError && insertError.code !== "23505") throw insertError;
+  async function backupOnce(user,csvText){
+    if(!csvText) return false;
+    const day=new Date().toISOString().slice(0,10);
+    const {data,error}=await client.from("invoice_backups").select("id").eq("user_id",user.id).eq("backup_date",day).maybeSingle();
+    if(error) throw error;
+    if(data) return false;
+    const {error:insertError}=await client.from("invoice_backups").insert({user_id:user.id,backup_date:day,csv_text:csvText});
+    if(insertError && insertError.code!=="23505") throw insertError;
     return !insertError;
   }
 
-  async function loadMaster() {
-    const { data, error } = await client.from("invoice_master")
-      .select("csv_text").eq("user_id", currentUser.id).maybeSingle();
-    if (error) return new Response(error.message, { status: 500 });
-    if (!data) return new Response("Master invoice file not found", { status: 404 });
-    try { await createDailyBackup(data.csv_text); }
-    catch (e) { return new Response(e.message, { status: 500 }); }
-    return new Response(data.csv_text, { status: 200, headers: { "Content-Type": "text/csv; charset=utf-8" } });
+  async function cloudLoad(user){
+    setStatus("Connected to Supabase | Loading cloud database...",true);
+    const {data,error}=await client.from("invoice_master").select("csv_text").eq("user_id",user.id).maybeSingle();
+    if(error) throw error;
+    if(!data){setStatus("Connected to Supabase | New cloud database ready",true);return new Response("Not found",{status:404});}
+    await backupOnce(user,data.csv_text);
+    setStatus("Connected to Supabase | Cloud database loaded",true);
+    return new Response(data.csv_text,{status:200,headers:{"Content-Type":"text/csv; charset=utf-8"}});
   }
 
-  async function saveMaster(csvText) {
-    let backupCreated = false;
-    const { data: existing, error: readError } = await client.from("invoice_master")
-      .select("csv_text").eq("user_id", currentUser.id).maybeSingle();
-    if (readError) return new Response(readError.message, { status: 500 });
-    try { if (existing?.csv_text) backupCreated = await createDailyBackup(existing.csv_text); }
-    catch (e) { return new Response(e.message, { status: 500 }); }
-
-    const { error } = await client.from("invoice_master").upsert({
-      user_id: currentUser.id, csv_text: csvText, updated_at: new Date().toISOString()
-    }, { onConflict: "user_id" });
-    if (error) return new Response(error.message, { status: 500 });
-    return new Response(JSON.stringify({ saved: true, backupCreated }), {
-      status: 200, headers: { "Content-Type": "application/json" }
-    });
+  async function cloudSave(user,csvText){
+    if(!csvText || !csvText.includes("Invoice Number")) throw new Error("The generated invoice CSV is empty or invalid.");
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Saving...",true);
+    const {data:old,error:readError}=await client.from("invoice_master").select("csv_text").eq("user_id",user.id).maybeSingle();
+    if(readError) throw readError;
+    const backupCreated=old?.csv_text?await backupOnce(user,old.csv_text):false;
+    const {data:saved,error}=await client.from("invoice_master")
+      .upsert({user_id:user.id,csv_text:csvText,updated_at:new Date().toISOString()},{onConflict:"user_id"})
+      .select("user_id,updated_at").single();
+    if(error) throw error;
+    if(!saved || saved.user_id!==user.id) throw new Error("Supabase did not return the saved master record.");
+    const {data:verify,error:verifyError}=await client.from("invoice_master")
+      .select("csv_text,updated_at").eq("user_id",user.id).single();
+    if(verifyError) throw verifyError;
+    if(verify.csv_text!==csvText) throw new Error("Cloud verification failed: saved data did not match the invoice database.");
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Saved and verified",true);
+    return new Response(JSON.stringify({saved:true,backupCreated,updatedAt:verify.updated_at}),{status:200,headers:{"Content-Type":"application/json"}});
   }
+
+  const nativeFetch=window.fetch.bind(window);
+  window.fetch=async(input,init={})=>{
+    const raw=typeof input==="string"?input:input.url;
+    let path;try{path=new URL(raw,location.href).pathname;}catch{path=raw;}
+    if(path!=="/api/invoices") return nativeFetch(input,init);
+    try{
+      const user=await sessionUser();
+      if(!user){mountGate();gate.style.display="grid";setStatus("Sign in to access the cloud database");return new Response("Unauthorized",{status:401});}
+      return (init.method||"GET").toUpperCase()==="POST"?await cloudSave(user,String(init.body||"")):await cloudLoad(user);
+    }catch(e){console.error("Supabase invoice operation failed",e);setStatus("Supabase error: "+e.message);return new Response(e.message,{status:500});}
+  };
 })();
