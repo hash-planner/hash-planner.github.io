@@ -1,5 +1,5 @@
 (() => {
-  const ADAPTER_VERSION = "2026.10.15.3";
+  const ADAPTER_VERSION = "2026.10.15.4";
   const cfg = window.APEX_CONFIG || {};
   if (cfg.backendMode !== "supabase") return;
 
@@ -86,44 +86,70 @@
   };
   gate.querySelector("#apex-login-password").addEventListener("keydown",e=>{if(e.key==="Enter")gate.querySelector("#apex-login-button").click();});
 
-  async function backupOnce(user,csvText){
+  async function createSnapshotOnce(user,csvText){
     if(!csvText) return false;
     const day=new Date().toISOString().slice(0,10);
     const {data,error}=await client.from("invoice_backups").select("id").eq("user_id",user.id).eq("backup_date",day).maybeSingle();
     if(error) throw error;
-    if(data) return false;
-    const {error:insertError}=await client.from("invoice_backups").insert({user_id:user.id,backup_date:day,csv_text:csvText});
-    if(insertError && insertError.code!=="23505") throw insertError;
-    return !insertError;
+    if(!data){
+      const {error:insertError}=await client.from("invoice_backups").insert({user_id:user.id,backup_date:day,csv_text:csvText});
+      if(insertError && insertError.code!=="23505") throw insertError;
+    }
+    const {data:all,error:listError}=await client.from("invoice_backups").select("id,backup_date").eq("user_id",user.id).order("backup_date",{ascending:false});
+    if(listError) throw listError;
+    const obsolete=(all||[]).slice(15).map(x=>x.id);
+    if(obsolete.length){
+      const {error:deleteError}=await client.from("invoice_backups").delete().eq("user_id",user.id).in("id",obsolete);
+      if(deleteError) throw deleteError;
+    }
+    return !data;
+  }
+
+  async function verifyCopy(table,user,csvText){
+    const {data,error}=await client.from(table).select("csv_text,updated_at").eq("user_id",user.id).single();
+    if(error) throw error;
+    if(data.csv_text!==csvText) throw new Error(table+" verification failed: stored data does not match.");
+    return data;
   }
 
   async function cloudLoad(user){
-    setStatus("Connected to Supabase | Loading cloud database...",true);
-    const {data,error}=await client.from("invoice_master").select("csv_text").eq("user_id",user.id).maybeSingle();
-    if(error) throw error;
-    if(!data){setStatus("Connected to Supabase | New cloud database ready",true);return new Response("Not found",{status:404});}
-    await backupOnce(user,data.csv_text);
-    setStatus("Connected to Supabase | Cloud database loaded",true);
-    return new Response(data.csv_text,{status:200,headers:{"Content-Type":"text/csv; charset=utf-8"}});
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Loading cloud database...",true);
+    const {data:master,error:masterError}=await client.from("invoice_master").select("csv_text,updated_at").eq("user_id",user.id).maybeSingle();
+    if(masterError) throw masterError;
+    const {data:mirror,error:mirrorError}=await client.from("invoice_mirror").select("csv_text,updated_at").eq("user_id",user.id).maybeSingle();
+    if(mirrorError) throw mirrorError;
+    if(!master && !mirror){setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | New cloud database ready",true);return new Response("Not found",{status:404});}
+    let csvText=master?.csv_text||mirror?.csv_text||"";
+    let recovered=false;
+    if(!master && mirror){
+      const {error}=await client.from("invoice_master").upsert({user_id:user.id,csv_text:csvText,updated_at:new Date().toISOString()},{onConflict:"user_id"});
+      if(error) throw error; recovered=true;
+    }
+    if(!mirror || mirror.csv_text!==csvText){
+      const {error}=await client.from("invoice_mirror").upsert({user_id:user.id,csv_text:csvText,updated_at:new Date().toISOString()},{onConflict:"user_id"});
+      if(error) throw error;
+    }
+    await createSnapshotOnce(user,csvText);
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | "+(recovered?"Recovered from mirror":"Cloud database loaded"),true);
+    return new Response(csvText,{status:200,headers:{"Content-Type":"text/csv; charset=utf-8"}});
   }
 
   async function cloudSave(user,csvText){
     if(!csvText || !csvText.includes("Invoice Number")) throw new Error("The generated invoice CSV is empty or invalid.");
-    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Saving...",true);
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Saving master...",true);
     const {data:old,error:readError}=await client.from("invoice_master").select("csv_text").eq("user_id",user.id).maybeSingle();
     if(readError) throw readError;
-    const backupCreated=old?.csv_text?await backupOnce(user,old.csv_text):false;
-    const {data:saved,error}=await client.from("invoice_master")
-      .upsert({user_id:user.id,csv_text:csvText,updated_at:new Date().toISOString()},{onConflict:"user_id"})
-      .select("user_id,updated_at").single();
-    if(error) throw error;
-    if(!saved || saved.user_id!==user.id) throw new Error("Supabase did not return the saved master record.");
-    const {data:verify,error:verifyError}=await client.from("invoice_master")
-      .select("csv_text,updated_at").eq("user_id",user.id).single();
-    if(verifyError) throw verifyError;
-    if(verify.csv_text!==csvText) throw new Error("Cloud verification failed: saved data did not match the invoice database.");
-    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Saved and verified",true);
-    return new Response(JSON.stringify({saved:true,backupCreated,updatedAt:verify.updated_at}),{status:200,headers:{"Content-Type":"application/json"}});
+    const snapshotCreated=old?.csv_text?await createSnapshotOnce(user,old.csv_text):false;
+    const now=new Date().toISOString();
+    const {error:masterError}=await client.from("invoice_master").upsert({user_id:user.id,csv_text:csvText,updated_at:now},{onConflict:"user_id"});
+    if(masterError) throw masterError;
+    await verifyCopy("invoice_master",user,csvText);
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Updating mirror...",true);
+    const {error:mirrorError}=await client.from("invoice_mirror").upsert({user_id:user.id,csv_text:csvText,updated_at:now},{onConflict:"user_id"});
+    if(mirrorError) throw mirrorError;
+    const verified=await verifyCopy("invoice_mirror",user,csvText);
+    setStatus("Connected to Supabase v"+ADAPTER_VERSION+" | Saved, mirrored and verified",true);
+    return new Response(JSON.stringify({saved:true,backupCreated:snapshotCreated,mirrored:true,updatedAt:verified.updated_at}),{status:200,headers:{"Content-Type":"application/json"}});
   }
 
   const nativeFetch=window.fetch.bind(window);
